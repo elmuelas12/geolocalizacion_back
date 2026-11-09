@@ -2,7 +2,7 @@ import { Request, Response } from "express";
 import { Earthquake } from "../models/Earthquake";
 import { Report } from "../models/Report";
 
-const initialEarthquakes = [
+export const initialEarthquakes = [
   {
     _id: "eq-choco-2026",
     title: "Sismo de Quibdó - Chocó",
@@ -72,7 +72,7 @@ const initialEarthquakes = [
   }
 ];
 
-const initialReports = [
+export const initialReports = [
   {
     _id: "rep-001",
     earthquakeId: "eq-choco-2026",

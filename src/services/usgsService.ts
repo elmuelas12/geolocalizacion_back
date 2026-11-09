@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import { Earthquake } from "../models/Earthquake";
 
 interface USGSFeature {
@@ -15,6 +16,12 @@ interface USGSFeature {
 }
 
 export const syncUSGSEarthquakes = async (): Promise<{ total: number; added: number }> => {
+  // Si MongoDB no está conectado, omitir silenciosamente sin romper el servidor
+  if (mongoose.connection.readyState !== 1) {
+    console.warn("ℹ️ [USGS Sync] Omitiendo sincronización automática: MongoDB no está conectado.");
+    return { total: 0, added: 0 };
+  }
+
   const url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_month.geojson";
   
   try {

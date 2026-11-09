@@ -1,9 +1,25 @@
 import { Request, Response } from "express";
-import { pgPool } from "../config/postgres";
+import { pgPool, isPostgresConnected } from "../config/postgres";
+
+// Sistema de Caché en Memoria RAM (Ultra-rápido, 5 min TTL) para consultas PostGIS pesadas
+const spatialCache = new Map<string, { timestamp: number; payload: any }>();
+const CACHE_TTL = 5 * 60 * 1000;
+
+function getFromCache(key: string) {
+  const cached = spatialCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return cached.payload;
+  }
+  return null;
+}
+
+function saveToCache(key: string, payload: any) {
+  spatialCache.set(key, { timestamp: Date.now(), payload });
+}
 
 /**
  * CONTROLADOR ESPACIAL - POSTGIS (EPSG 9377 - ORIGEN ÚNICO NACIONAL)
- * Implementación de 10 Consultas Espaciales asociadas a las capas geográficas
+ * Implementación de 11 Consultas Espaciales asociadas a las capas geográficas
  */
 
 // 1. Sismos dentro de Municipios (ST_Within en EPSG 9377)
@@ -226,6 +242,173 @@ export const getGeoJSONCapas = async (req: Request, res: Response) => {
     `;
     const result = await pgPool.query(query);
     res.json({ title: `Consulta 10: Capa GeoJSON [${capa}] (EPSG 9377 -> 4326)`, data: result.rows[0].geojson });
+  } catch (error) {
+    res.status(500).json({ message: (error as Error).message });
+  }
+};
+
+// 11. Teselado Espacial Regular y Voronoi (ST_HexagonGrid, ST_SquareGrid, ST_VoronoiPolygons en EPSG 9377)
+export const getTeseladoEspacial = async (req: Request, res: Response) => {
+  try {
+    const tipo = (req.query.tipo as string) || "hexagonal"; // "hexagonal" | "cuadricula" | "voronoi"
+    const radioMetros = parseInt(req.query.size as string) || 50000; // 50 km por defecto
+    const capa = (req.query.capa as string) || "sismos"; // "sismos" | "reportes"
+    const onlyWithEvents = req.query.onlyWithEvents !== "false"; // filtrar celdas con eventos
+
+    // Verificación en Caché RAM ultra-rápida (1-2 ms)
+    const cacheKey = `tess_${tipo}_${radioMetros}_${capa}_${onlyWithEvents}`;
+    const cached = getFromCache(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const tablaEventos = capa === "reportes" ? "public.reportes_espacial" : "public.sismos_espacial";
+
+    let query = "";
+    if (tipo === "voronoi") {
+      query = `
+        WITH coleccion AS (
+          SELECT ST_Collect(geom) AS geom_coleccion FROM ${tablaEventos}
+        ),
+        bounding_box AS (
+          SELECT COALESCE(
+            (SELECT ST_SetSRID(ST_Extent(geom), 9377) FROM public.municipios_colombia),
+            (SELECT ST_SetSRID(ST_Extent(geom), 9377) FROM ${tablaEventos}),
+            ST_MakeEnvelope(4000000, 1500000, 5500000, 3200000, 9377)
+          ) AS bbox
+        ),
+        poligonos_voronoi AS (
+          SELECT (ST_Dump(ST_VoronoiPolygons(c.geom_coleccion, 0.0, b.bbox))).geom AS geom
+          FROM coleccion c, bounding_box b
+        ),
+        voronoi_stats AS (
+          SELECT 
+            row_number() OVER () AS cell_id,
+            v.geom,
+            COUNT(s.id) AS total_eventos,
+            ${capa === "sismos" 
+              ? "ROUND(COALESCE(AVG(s.magnitude), 0)::numeric, 2) AS magnitud_promedio, ROUND(COALESCE(MAX(s.magnitude), 0)::numeric, 2) AS magnitud_maxima, ROUND(COALESCE(AVG(s.depth), 0)::numeric, 1) AS profundidad_promedio," 
+              : "ROUND(COALESCE(SUM(s.affected_people), 0)::numeric, 0) AS total_afectados,"}
+            ROUND((ST_Area(v.geom) / 1000000)::numeric, 2) AS area_km2
+          FROM poligonos_voronoi v
+          LEFT JOIN ${tablaEventos} s ON ST_Intersects(v.geom, s.geom)
+          GROUP BY v.geom
+        )
+        SELECT json_build_object(
+          'type', 'FeatureCollection',
+          'features', COALESCE(json_agg(
+            json_build_object(
+              'type', 'Feature',
+              'geometry', ST_AsGeoJSON(ST_Transform(vs.geom, 4326))::json,
+              'properties', json_build_object(
+                'cell_id', concat('VOR-', vs.cell_id),
+                'tipo_malla', 'Teselado Voronoi (Polígonos de Thiessen)',
+                'total_eventos', vs.total_eventos,
+                ${capa === "sismos" ? "'magnitud_promedio', vs.magnitud_promedio, 'magnitud_maxima', vs.magnitud_maxima, 'profundidad_promedio', vs.profundidad_promedio," : "'total_afectados', vs.total_afectados,"}
+                'area_km2', vs.area_km2,
+                'densidad', CASE 
+                  WHEN vs.total_eventos >= 5 THEN 'Muy Alta'
+                  WHEN vs.total_eventos >= 3 THEN 'Alta'
+                  WHEN vs.total_eventos >= 1 THEN 'Media'
+                  ELSE 'Baja'
+                END
+              )
+            )
+          ), '[]'::json) AS geojson,
+          COALESCE(json_agg(
+            json_build_object(
+              'celda', concat('VOR-', vs.cell_id),
+              'total_eventos', vs.total_eventos,
+              ${capa === "sismos" ? "'magnitud_promedio', vs.magnitud_promedio, 'magnitud_maxima', vs.magnitud_maxima," : "'total_afectados', vs.total_afectados,"}
+              'area_km2', vs.area_km2
+            )
+          ), '[]'::json) AS stats
+        FROM voronoi_stats vs;
+      `;
+    } else {
+      const gridFunction = tipo === "cuadricula" ? "ST_SquareGrid" : "ST_HexagonGrid";
+      query = `
+        WITH bounding_box AS (
+          SELECT COALESCE(
+            (SELECT ST_SetSRID(ST_Extent(geom), 9377) FROM public.municipios_colombia),
+            (SELECT ST_SetSRID(ST_Extent(geom), 9377) FROM ${tablaEventos}),
+            ST_MakeEnvelope(4000000, 1500000, 5500000, 3200000, 9377)
+          ) AS bbox
+        ),
+        grid AS (
+          SELECT g.geom, g.i, g.j 
+          FROM bounding_box b,
+          LATERAL ${gridFunction}($1, b.bbox) g
+        ),
+        cell_stats AS (
+          SELECT 
+            g.i,
+            g.j,
+            g.geom,
+            COUNT(s.id) AS total_eventos,
+            ${capa === "sismos" 
+              ? "ROUND(COALESCE(AVG(s.magnitude), 0)::numeric, 2) AS magnitud_promedio, ROUND(COALESCE(MAX(s.magnitude), 0)::numeric, 2) AS magnitud_maxima, ROUND(COALESCE(AVG(s.depth), 0)::numeric, 1) AS profundidad_promedio," 
+              : "ROUND(COALESCE(SUM(s.affected_people), 0)::numeric, 0) AS total_afectados,"}
+            ROUND((ST_Area(g.geom) / 1000000)::numeric, 2) AS area_km2
+          FROM grid g
+          ${onlyWithEvents ? "JOIN" : "LEFT JOIN"} ${tablaEventos} s 
+            ON ST_Intersects(g.geom, s.geom)
+          GROUP BY g.i, g.j, g.geom
+          ${onlyWithEvents ? "HAVING COUNT(s.id) > 0" : ""}
+        )
+        SELECT json_build_object(
+          'type', 'FeatureCollection',
+          'features', COALESCE(json_agg(
+            json_build_object(
+              'type', 'Feature',
+              'geometry', ST_AsGeoJSON(ST_Transform(cs.geom, 4326))::json,
+              'properties', json_build_object(
+                'cell_id', concat('${tipo === "cuadricula" ? "GRID" : "HEX"}-', cs.i, '-', cs.j),
+                'i', cs.i,
+                'j', cs.j,
+                'tipo_malla', '${tipo === "cuadricula" ? "Cuadrícula Regular (ST_SquareGrid)" : "Hexagonal (ST_HexagonGrid)"}',
+                'total_eventos', cs.total_eventos,
+                ${capa === "sismos" ? "'magnitud_promedio', cs.magnitud_promedio, 'magnitud_maxima', cs.magnitud_maxima, 'profundidad_promedio', cs.profundidad_promedio," : "'total_afectados', cs.total_afectados,"}
+                'area_km2', cs.area_km2,
+                'densidad', CASE 
+                  WHEN cs.total_eventos >= 8 THEN 'Muy Alta'
+                  WHEN cs.total_eventos >= 4 THEN 'Alta'
+                  WHEN cs.total_eventos >= 2 THEN 'Media'
+                  WHEN cs.total_eventos = 1 THEN 'Baja'
+                  ELSE 'Sin Eventos'
+                END
+              )
+            )
+          ), '[]'::json) AS geojson,
+          COALESCE(json_agg(
+            json_build_object(
+              'celda', concat('${tipo === "cuadricula" ? "GRID" : "HEX"}-', cs.i, '-', cs.j),
+              'total_eventos', cs.total_eventos,
+              ${capa === "sismos" ? "'magnitud_promedio', cs.magnitud_promedio, 'magnitud_maxima', cs.magnitud_maxima," : "'total_afectados', cs.total_afectados,"}
+              'area_km2', cs.area_km2
+            )
+          ), '[]'::json) AS stats
+        FROM cell_stats cs;
+      `;
+    }
+
+    const params = tipo === "voronoi" ? [] : [radioMetros];
+    const result = await pgPool.query(query, params);
+
+    const geojson = result.rows[0]?.geojson || { type: "FeatureCollection", features: [] };
+    const stats = result.rows[0]?.stats || [];
+
+    const responsePayload = {
+      title: `Consulta 11: Teselado Espacial ${tipo === "cuadricula" ? "Cuadrangular (ST_SquareGrid)" : tipo === "voronoi" ? "Voronoi (ST_VoronoiPolygons)" : "Hexagonal (ST_HexagonGrid)"} (${radioMetros / 1000} km)`,
+      tipo,
+      radioKm: radioMetros / 1000,
+      totalCeldas: geojson.features?.length || 0,
+      data: stats,
+      geojson
+    };
+
+    saveToCache(cacheKey, responsePayload);
+    res.json(responsePayload);
   } catch (error) {
     res.status(500).json({ message: (error as Error).message });
   }
